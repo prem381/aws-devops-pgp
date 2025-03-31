@@ -1,0 +1,247 @@
+# =======================================================================================
+
+# ====== Infrastructure Setup (Using Terraform) =========
+
+# We will use Terraform to provision the AWS infrastructure:
+# VPC with Private Subnets (No Public IPs or Internet access)
+# Auto Scaling Group with EC2 Instances (Managed via AWS CodeDeploy)
+# EFS for Shared Storage
+# S3 for Artifact Storage (Solves unpredictable storage space issue)
+# RDS for Database
+# EKS for Kubernetes Deployment
+
+#========================================================================================
+
+# main.tf
+
+terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+      version = "5.82.1"
+    }
+  }
+}
+provider "aws" {
+  alias  = "virginia"
+  region = "us-east-1" # Virginia
+  access_key = "AKIAWQVxxxxxxxxxxxxxx"
+  secret_key = "5CciUlYURJs9SJxxxxxxxxxxxxxxxxxxxxxxxx"
+  tags = {
+    name = "demovpc"
+  }
+}
+resource "aws_vpc" "main" {
+  region_id = aws_virginia
+  cidr_block = "10.0.0.0/16"
+}
+
+resource "aws_subnet" "private_subnet_1" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+}
+
+resource "aws_subnet" "private_subnet_2" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "us-east-1b"
+}
+
+#================================================================================
+
+# storage.tf
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "company-ci-cd-artifacts"
+}
+
+resource "aws_efs_file_system" "shared_storage" {}
+
+resource "aws_efs_mount_target" "efs_mount_1" {
+  file_system_id = aws_efs_file_system.shared_storage.id
+  subnet_id      = aws_subnet.private_subnet_1.id
+}
+
+resource "aws_efs_mount_target" "efs_mount_2" {
+  file_system_id = aws_efs_file_system.shared_storage.id
+  subnet_id      = aws_subnet.private_subnet_2.id
+}
+
+
+#====================================================================================
+
+# autoscaling.tf
+
+resource "aws_autoscaling_policy" "cpu_scale_up" {
+  name                   = "cpu-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.app_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown              = 300
+  policy_type           = "SimpleScaling"
+}
+
+resource "aws_autoscaling_policy" "cpu_scale_down" {
+  name                   = "cpu-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.app_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown              = 300
+  policy_type           = "SimpleScaling"
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace          = "AWS/EC2"
+  period             = 60
+  statistic          = "Average"
+  threshold          = 80
+  alarm_description  = "Scale up when CPU exceeds 80%"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app_asg.name
+  }
+  actions_enabled = true
+  alarm_actions   = [aws_autoscaling_policy.cpu_scale_up.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_low" {
+  alarm_name          = "cpu-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace          = "AWS/EC2"
+  period             = 60
+  statistic          = "Average"
+  threshold          = 30
+  alarm_description  = "Scale down when CPU falls below 30%"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app_asg.name
+  }
+  actions_enabled = true
+  alarm_actions   = [aws_autoscaling_policy.cpu_scale_down.arn]
+}
+
+
+# ==================================================================================
+
+# database.tf
+
+resource "aws_db_instance" "app_db" {
+  allocated_storage    = 20
+  engine              = "mysql"
+  instance_class      = "db.t3.micro"
+  name               = "appdb"
+  username           = "admin"
+  password           = "securepassword"
+  skip_final_snapshot = true
+  vpc_security_group_ids = [aws_security_group.db_sg.id]
+  db_subnet_group_name   = aws_db_subnet_group.app_db_subnet_group.name
+}
+
+resource "aws_db_subnet_group" "app_db_subnet_group" {
+  name       = "app-db-subnet-group"
+  subnet_ids = [aws_subnet.private_subnet_1.id, aws_subnet.private_subnet_2.id]
+}
+
+
+# =================================================================================
+
+# Appspec.yml
+
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /var/www/app
+hooks:
+  ApplicationStart:
+    - location: scripts/start_app.sh
+      timeout: 300
+      runas: root
+
+
+# ==================================================================================
+
+# .github/workflows/deploy.yml
+
+name: Deploy Application
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Build Docker Image
+        run: |
+          docker build -t myapp:latest .
+          docker tag myapp:latest <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/myapp:latest
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
+          docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/myapp:latest
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+# ========================================================================================
+
+# deployment.yml deployment with NodePort service
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+        - name: myapp
+          image: mydockerhub/myapp:latest
+          ports:
+            - containerPort: 80
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-service
+spec:
+  type: NodePort
+  selector:
+    app: myapp
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+
+
+# ===========================================================================================
+
+# ============= Final Architecture Overview ====================
+# GitHub → AWS CodeDeploy → Auto Scaling Group (for software deployment)
+# GitHub → Docker Hub → EKS (for container deployment)
+# AWS RDS manages the database separately.
+# AWS EFS provides shared storage for the application servers.
+# AWS S3 handles unpredictable artifact storage.
+# Auto Scaling adjusts EC2 instances based on CPU usage.
+
+# ==========================================================================================
