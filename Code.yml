@@ -1,5 +1,17 @@
 # =======================================================================================
 
+# Launch ec2 instance and install aws cli then configure with IAM user credential
+# Install unzip and aws cli
+sudo apt-get install unzip
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+# configure aws cli
+aws configure
+
+# ======================================================================================
+
 # ====== Infrastructure Setup (Using Terraform) =========
 
 # We will use Terraform to provision the AWS infrastructure:
@@ -25,8 +37,6 @@ terraform {
 provider "aws" {
   alias  = "virginia"
   region = "us-east-1" # Virginia
-  access_key = "AKIAWQVxxxxxxxxxxxxxx"
-  secret_key = "5CciUlYURJs9SJxxxxxxxxxxxxxxxxxxxxxxxx"
   tags = {
     name = "demovpc"
   }
